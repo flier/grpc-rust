@@ -4,11 +4,14 @@ use protobuf;
 use protobuf::compiler_plugin;
 use protobuf::descriptor::*;
 
-pub fn gen(file_descriptors: &[FileDescriptorProto], files_to_generate: &[String])
-        -> Vec<compiler_plugin::GenResult>
-{
-    let files_map: HashMap<&str, &FileDescriptorProto> =
-        file_descriptors.iter().map(|f| (f.get_name(), f)).collect();
+pub fn gen(file_descriptors: &[FileDescriptorProto],
+           files_to_generate: &[String])
+           -> Vec<compiler_plugin::GenResult> {
+    let files_map: HashMap<&str, &FileDescriptorProto> = file_descriptors.iter()
+                                                                         .map(|f| {
+                                                                             (f.get_name(), f)
+                                                                         })
+                                                                         .collect();
 
     let mut results = Vec::new();
 

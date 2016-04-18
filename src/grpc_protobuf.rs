@@ -10,7 +10,7 @@ struct ProtobufMarshaller<M> {
     _marker: marker::PhantomData<M>,
 }
 
-impl<M : Message + MessageStatic> Marshaller<M> for ProtobufMarshaller<M> {
+impl<M: Message + MessageStatic> Marshaller<M> for ProtobufMarshaller<M> {
     fn write(&self, m: &M) -> Vec<u8> {
         m.write_to_bytes().unwrap()
     }

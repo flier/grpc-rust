@@ -19,7 +19,7 @@ impl<A> MethodHandler<A, A> for MethodHandlerEcho {
     fn handle(&self, req: A) -> A {
         req
     }
-} 
+}
 
 trait MethodHandlerDispatch {
     fn on_message(&self, message: &[u8]) -> Vec<u8>;
@@ -44,12 +44,14 @@ pub struct ServerMethod {
 }
 
 impl ServerMethod {
-    fn new<Req : 'static, Resp : 'static>(method: MethodDescriptor<Req, Resp>, handler: Box<MethodHandler<Req, Resp>>) -> ServerMethod {
+    fn new<Req: 'static, Resp: 'static>(method: MethodDescriptor<Req, Resp>,
+                                        handler: Box<MethodHandler<Req, Resp>>)
+                                        -> ServerMethod {
         ServerMethod {
             name: method.name.clone(),
             dispatch: Box::new(MethodHandlerDispatchImpl {
                 desc: method,
-                method_handler: handler,    
+                method_handler: handler,
             }),
         }
     }
@@ -61,25 +63,20 @@ pub struct ServerServiceDefinition {
 
 impl ServerServiceDefinition {
     pub fn new(mut methods: Vec<ServerMethod>) -> ServerServiceDefinition {
-        methods.push(
-            ServerMethod::new(
-                MethodDescriptor {
-                    name: "/helloworld.Greeter/SayHello".to_owned(),
-                    input_streaming: false,
-                    output_streaming: false,
-                    req_marshaller: Box::new(MarshallerBytes),
-                    resp_marshaller: Box::new(MarshallerBytes),
-                },
-                Box::new(MethodHandlerEcho)
-            )
-        );
-        ServerServiceDefinition {
-            methods: methods,
-        }
+        methods.push(ServerMethod::new(MethodDescriptor {
+                                           name: "/helloworld.Greeter/SayHello".to_owned(),
+                                           input_streaming: false,
+                                           output_streaming: false,
+                                           req_marshaller: Box::new(MarshallerBytes),
+                                           resp_marshaller: Box::new(MarshallerBytes),
+                                       },
+                                       Box::new(MethodHandlerEcho)));
+        ServerServiceDefinition { methods: methods }
     }
 
     pub fn handle_method(&self, name: &str, message: &[u8]) -> Vec<u8> {
-        self.methods.iter()
+        self.methods
+            .iter()
             .filter(|m| m.name == name)
             .next()
             .expect(&format!("unknown method: {}", name))

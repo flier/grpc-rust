@@ -3,12 +3,23 @@
 name = "grpc"
 version = "0.0.1"
 
+[dependencies]
+log = "0.3"
+
 [dependencies.solicit]
 git = "http://github.com/mlalic/solicit.git"
+features = ["tls"]
+
+[dependencies.openssl]
+version = "0.6"
+features = ["tlsv1_1", "tlsv1_2", "npn", "alpn"]
 
 [dependencies.protobuf]
 #git = "http://github.com/stepancheg/rust-protobuf"
 path = "../rust-protobuf"
+
+[dev-dependencies]
+env_logger = "0.3"
 
 [[bin]]
 
@@ -19,3 +30,11 @@ test = false
 
 name = "temp-server"
 test = false
+
+[[example]]
+name = "greeter_client"
+path = "examples/helloworld/client.rs"
+
+[[example]]
+name = "greeter_server"
+path = "examples/helloworld/server.rs"

@@ -1,9 +1,11 @@
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::net::ToSocketAddrs;
 use std::fmt;
 use std::io::Cursor;
 use std::io::Read;
 use std::convert::From;
+use std::sync::Arc;
 
 use solicit::server::SimpleServer;
 use solicit::http::server::StreamFactory;
@@ -32,7 +34,10 @@ use solicit::http::session::StreamDataError;
 use solicit::http::transport::TransportStream;
 use solicit::http::transport::TransportReceiveFrame;
 
+use openssl::ssl::{Ssl, SslContext, SslStream, SslMethod, SSL_VERIFY_NONE};
+
 use grpc;
+use errors::GrpcResult;
 use method::ServerServiceDefinition;
 
 struct BsDebug<'a>(&'a [u8]);
@@ -50,17 +55,19 @@ impl<'a> fmt::Debug for BsDebug<'a> {
             }
         }
         try!(write!(fmt, "\""));
-    	Ok(())
+        Ok(())
     }
 }
 
 struct HeaderDebug<'a>(&'a Header<'a, 'a>);
 
 impl<'a> fmt::Debug for HeaderDebug<'a> {
-	fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-	    write!(fmt, "Header {{ name: {:?}, value: {:?} }}",
-	    	BsDebug(self.0.name()), BsDebug(self.0.value()))
-	}
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        write!(fmt,
+               "Header {{ name: {:?}, value: {:?} }}",
+               BsDebug(self.0.name()),
+               BsDebug(self.0.value()))
+    }
 }
 
 struct GrpcStream {
@@ -115,11 +122,14 @@ impl Stream for GrpcStream {
                 self.path = String::from_utf8(h.value().to_owned()).unwrap();
             }
         }
-        println!("headers: {:?}", headers.iter().map(|h| HeaderDebug(h)).collect::<Vec<_>>());
-        self.headers = Some(headers.into_iter().map(|h| {
-            let owned: OwnedHeader = h.into();
-            owned.into()
-        }).collect());
+        println!("headers: {:?}",
+                 headers.iter().map(|h| HeaderDebug(h)).collect::<Vec<_>>());
+        self.headers = Some(headers.into_iter()
+                                   .map(|h| {
+                                       let owned: OwnedHeader = h.into();
+                                       owned.into()
+                                   })
+                                   .collect());
     }
 
     fn new_data_chunk(&mut self, data: &[u8]) {
@@ -144,7 +154,7 @@ impl Stream for GrpcStream {
         let chunk = match self.data.as_mut() {
             // No data associated to the stream, but it's open => nothing available for writing
             None => StreamDataChunk::Unavailable,
-            Some(d) =>  {
+            Some(d) => {
                 // For the `Vec`-backed reader, this should never fail, so unwrapping is
                 // fine.
                 let read = d.read(buf).unwrap();
@@ -158,7 +168,7 @@ impl Stream for GrpcStream {
         // Transition the stream state to locally closed if we've extracted the final data chunk.
         match chunk {
             StreamDataChunk::Last(_) => self.close_local(),
-            _ => {},
+            _ => {}
         };
 
         Ok(chunk)
@@ -169,40 +179,39 @@ impl Stream for GrpcStream {
     }
 }
 
-/*
-struct GrpcSessionState {
-    default_state: DefaultSessionState,
-}
-
-impl GrpcSessionState {
-    fn new() -> Self {
-        GrpcSessionState {
-            default_state: DefaultSessionState::new(),
-        }
-    }
-}
-*/
+// struct GrpcSessionState {
+// default_state: DefaultSessionState,
+// }
+//
+// impl GrpcSessionState {
+// fn new() -> Self {
+// GrpcSessionState {
+// default_state: DefaultSessionState::new(),
+// }
+// }
+// }
+//
 
 struct GrpcStreamFactory;
 
 impl StreamFactory for GrpcStreamFactory {
-	type Stream = GrpcStream;
+    type Stream = GrpcStream;
 
-	fn create(&mut self, id: StreamId) -> GrpcStream {
-		GrpcStream::with_id(id)
-	}
+    fn create(&mut self, id: StreamId) -> GrpcStream {
+        GrpcStream::with_id(id)
+    }
 }
 
-struct GrpcServerConnection {
+struct GrpcServerConnection<TS: TransportStream> {
     conn: HttpConnection,
     factory: GrpcStreamFactory,
     state: DefaultSessionState<Server, GrpcStream>,
-    receiver: TcpStream,
-    sender: TcpStream,
+    receiver: TS,
+    sender: TS,
 }
 
-impl GrpcServerConnection {
-    fn new(mut stream: TcpStream) -> GrpcServerConnection {
+impl<TS: TransportStream> GrpcServerConnection<TS> {
+    fn new(mut stream: TS) -> GrpcServerConnection<TS> {
         let mut preface = [0; 24];
 
         (&mut stream as &mut Read).read_exact(&mut preface).unwrap();
@@ -212,7 +221,7 @@ impl GrpcServerConnection {
 
         let conn = HttpConnection::new(HttpScheme::Http);
 
-		let mut xx: TcpStream = stream.try_split().unwrap();
+        let mut xx: TS = stream.try_split().unwrap();
         let mut r = GrpcServerConnection {
             conn: conn,
             state: DefaultSessionState::<Server, _>::new(),
@@ -221,38 +230,41 @@ impl GrpcServerConnection {
             factory: GrpcStreamFactory,
         };
 
-        //r.server_conn.init().unwrap();
+        // r.server_conn.init().unwrap();
         r
     }
-    
+
     fn handle_requests(&mut self) -> HttpResult<Vec<(StreamId, Vec<u8>)>> {
-        Ok(self.state.iter().flat_map(|(&id, s)| {
-            if s.resp.is_empty() {
-                None
-            } else {
-                Some((id, s.resp.clone()))
-            }        
-        }).collect())
+        Ok(self.state
+               .iter()
+               .flat_map(|(&id, s)| {
+                   if s.resp.is_empty() {
+                       None
+                   } else {
+                       Some((id, s.resp.clone()))
+                   }
+               })
+               .collect())
     }
-    
+
     fn prepare_responses(&mut self, responses: Vec<(StreamId, Vec<u8>)>) -> HttpResult<()> {
         for r in responses {
-            try!(self.conn.sender(&mut self.sender).send_headers(
-                vec![
-                	Header::new(b":status", b"200"),
-                	Header::new(&b"content-type"[..], &b"application/grpc"[..]),
+            try!(self.conn.sender(&mut self.sender).send_headers(vec![
+                    Header::new(b":status", b"200"),
+                    Header::new(&b"content-type"[..], &b"application/grpc"[..]),
                 ],
-                r.0,
-                EndStream::No));
-            
-            try!(self.conn.sender(&mut self.sender).send_data(DataChunk::new_borrowed(&r.1[..], r.0, EndStream::No)));
-            
-            try!(self.conn.sender(&mut self.sender).send_headers(
-                vec![
-                	Header::new(&b"grpc-status"[..], b"0"),
+                                                                 r.0,
+                                                                 EndStream::No));
+
+            try!(self.conn
+                     .sender(&mut self.sender)
+                     .send_data(DataChunk::new_borrowed(&r.1[..], r.0, EndStream::No)));
+
+            try!(self.conn.sender(&mut self.sender).send_headers(vec![
+                    Header::new(&b"grpc-status"[..], b"0"),
                 ],
-                r.0,
-                EndStream::Yes));
+                                                                 r.0,
+                                                                 EndStream::Yes));
         }
         Ok(())
     }
@@ -276,7 +288,8 @@ impl GrpcServerConnection {
     fn reap_streams(&mut self) {
         // Moves the streams out of the state and then drops them
         let closed = self.state.get_closed();
-        println!("closed: {:?}", closed.iter().map(|s| s.stream_id).collect::<Vec<_>>());
+        println!("closed: {:?}",
+                 closed.iter().map(|s| s.stream_id).collect::<Vec<_>>());
     }
 
     pub fn handle_next_frame(&mut self) -> HttpResult<()> {
@@ -287,10 +300,10 @@ impl GrpcServerConnection {
 
     fn handle_next(&mut self) -> HttpResult<()> {
         try!(self.handle_next_frame());
-        
+
         let responses = try!(self.handle_requests());
 
-		try!(self.prepare_responses(responses));
+        try!(self.prepare_responses(responses));
 
         try!(self.flush_streams());
         self.reap_streams();
@@ -306,28 +319,88 @@ impl GrpcServerConnection {
                     println!("{:?}", e);
                     return;
                 }
-                _ => {},
+                _ => {}
             }
         }
     }
 }
 
-pub struct GrpcServer {
+pub trait GrpcServer<TS> where TS: TransportStream {
+    fn accept(&self) -> GrpcResult<TS>;
+
+    fn run(&mut self) {
+        loop {
+            match self.accept() {
+                Ok(stream) => GrpcServerConnection::<TS>::new(stream).run(),
+                Err(ref err) => {
+                    warn!("accept error, {}", err);
+                }
+            }
+        }
+    }
+}
+
+pub struct TcpServer {
     listener: TcpListener,
 }
 
-impl GrpcServer {
-    pub fn new() -> GrpcServer {
-        GrpcServer {
-            listener: TcpListener::bind("127.0.0.1:50051").unwrap(),
-        }
-    }
+impl TcpServer {
+    pub fn new<A: ToSocketAddrs>(addr: A) -> GrpcResult<TcpServer> {
+        let listener = try!(TcpListener::bind(addr));
 
-    pub fn run(&mut self) {
-        for mut stream in self.listener.incoming().map(|s| s.unwrap()) {
-            println!("client connected!");
-            GrpcServerConnection::new(stream).run();
-        }
+        info!("TCP server is listening on {}", try!(listener.local_addr()));
+
+        Ok(TcpServer { listener: listener })
     }
 }
 
+impl GrpcServer<TcpStream> for TcpServer {
+    fn accept(&self) -> GrpcResult<TcpStream> {
+        let (stream, addr) = try!(self.listener.accept());
+
+        info!("accepted TCP connection from {}", addr);
+
+        Ok(stream)
+    }
+}
+
+pub struct SslServer {
+    listener: TcpListener,
+    context: Arc<SslContext>,
+}
+
+impl SslServer {
+    pub fn new<A: ToSocketAddrs>(addr: A) -> GrpcResult<SslServer> {
+        let listener = try!(TcpListener::bind(addr));
+
+        info!("SSL server is listening on {}", try!(listener.local_addr()));
+
+        Ok(SslServer {
+            listener: listener,
+            context: Arc::new({
+                let mut ctxt = try!(SslContext::new(SslMethod::Tlsv1_1));
+
+                try!(ctxt.set_cipher_list("DEFAULT"));
+                ctxt.set_verify(SSL_VERIFY_NONE, None);
+
+                // TODO more SSL config
+
+                ctxt
+            }),
+        })
+    }
+}
+
+impl GrpcServer<SslStream<TcpStream>> for SslServer {
+    fn accept(&self) -> GrpcResult<SslStream<TcpStream>> {
+        let (stream, addr) = try!(self.listener.accept());
+
+        debug!("SSL handshake from {}", addr);
+
+        let stream = try!(SslStream::accept(&*self.context, stream));
+
+        info!("accepted SSL connection from {}", addr);
+
+        Ok(stream)
+    }
+}
