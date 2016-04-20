@@ -6,10 +6,8 @@ extern crate protobuf;
 extern crate grpc;
 
 use std::thread;
-use std::net::ToSocketAddrs;
 
-use grpc::errors::GrpcResult;
-use grpc::server::{GrpcServer, TcpServer, SslServer};
+use grpc::server::{GrpcServer, TcpServer};
 
 mod helloworld;
 
@@ -17,16 +15,18 @@ use helloworld::{HelloRequest, HelloReply, Greeter};
 
 impl Greeter for TcpServer {
     fn SayHello(req: HelloRequest) -> ::protobuf::ProtobufResult<HelloReply> {
-        unimplemented!()
+        let mut res = HelloReply::new();
+
+        res.set_message(format!("hello {}", req.get_name()));
+
+        Ok(res)
     }
 }
 
 fn main() {
     env_logger::init().unwrap();
 
-    let tcpServer = thread::spawn(move || TcpServer::new("127.0.0.1:50051").unwrap().run());
-    let sslServer = thread::spawn(move || SslServer::new("127.0.0.1:50052").unwrap().run());
-
-    tcpServer.join();
-    sslServer.join();
+    TcpServer::new("127.0.0.1:50051").unwrap().run(|mut conn| {
+        thread::spawn(move || conn.run());
+    });
 }
