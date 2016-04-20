@@ -6,8 +6,9 @@ extern crate protobuf;
 extern crate grpc;
 
 use std::thread;
+use std::sync::Arc;
 
-use grpc::server::{GrpcServer, TcpServer};
+use grpc::server::{GrpcRouter, GrpcServer, TcpServer};
 
 mod helloworld;
 
@@ -26,7 +27,9 @@ impl Greeter for TcpServer {
 fn main() {
     env_logger::init().unwrap();
 
-    TcpServer::new("127.0.0.1:50051").unwrap().run(|mut conn| {
+    let router = GrpcRouter::new();
+
+    TcpServer::new(Arc::new(router), "127.0.0.1:50051").unwrap().run(|mut conn| {
         thread::spawn(move || conn.run());
     });
 }

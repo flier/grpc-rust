@@ -6,6 +6,7 @@ use std::io::Cursor;
 use std::io::Read;
 use std::convert::From;
 use std::sync::Arc;
+use std::error::Error;
 
 use solicit::server::SimpleServer;
 use solicit::http::server::StreamFactory;
@@ -17,6 +18,9 @@ use solicit::http::Header;
 use solicit::http::HeaderPart;
 use solicit::http::OwnedHeader;
 use solicit::http::HttpResult;
+use solicit::http::Request;
+use solicit::http::Response;
+use solicit::http::StaticResponse;
 use solicit::http::priority::SimplePrioritizer;
 use solicit::http::connection::HttpConnection;
 use solicit::http::connection::EndStream;
@@ -70,17 +74,43 @@ impl<'a> fmt::Debug for HeaderDebug<'a> {
     }
 }
 
-type GrpcStream = DefaultStream;
-
-trait GrpcRequestHandler {
-    fn handle_request(&self, id: StreamId) -> Option<(StreamId, Vec<u8>)>;
+/// The struct represents a fully received request.
+pub struct GrpcRequest<'a, 'n, 'v>
+    where 'n: 'a,
+          'v: 'a
+{
+    pub stream_id: StreamId,
+    pub headers: &'a [Header<'n, 'v>],
+    pub body: &'a [u8],
 }
 
-impl GrpcRequestHandler for GrpcStream {
-    fn handle_request(&self, id: StreamId) -> Option<(StreamId, Vec<u8>)> {
-        None
+pub type GrpcResponse = StaticResponse;
+
+#[derive(Clone, Default)]
+pub struct GrpcRouter {
+}
+
+unsafe impl Send for GrpcRouter {}
+unsafe impl Sync for GrpcRouter {}
+
+impl GrpcRouter {
+    pub fn new() -> GrpcRouter {
+        Default::default()
+    }
+
+    fn handle_request(&self, req: GrpcRequest) -> GrpcResponse {
+        Response {
+            headers: vec![
+                        Header::new(b":status", b"200"),
+                        Header::new(&b"content-type"[..], &b"application/grpc"[..]),
+                    ],
+            body: req.body.to_vec(),
+            stream_id: req.stream_id,
+        }
     }
 }
+
+type GrpcStream = DefaultStream;
 
 struct GrpcStreamFactory;
 
@@ -96,12 +126,11 @@ struct GrpcServerConnection<TS: TransportStream> {
     conn: ServerConnection<GrpcStreamFactory, DefaultSessionState<ServerMarker, GrpcStream>>,
     receiver: TS,
     sender: TS,
+    router: Arc<GrpcRouter>,
 }
 
-unsafe impl<TS: TransportStream + Send> Send for GrpcServerConnection<TS> {}
-
 impl<TS: TransportStream + Sized> GrpcServerConnection<TS> {
-    fn new(mut stream: TS) -> GrpcResult<Self> {
+    fn new(router: Arc<GrpcRouter>, mut stream: TS) -> GrpcResult<Self> {
         let mut preface = [0; 24];
 
         try!(TransportStream::read_exact(&mut stream, &mut preface));
@@ -117,6 +146,7 @@ impl<TS: TransportStream + Sized> GrpcServerConnection<TS> {
             conn: conn,
             receiver: try!(stream.try_split()),
             sender: stream,
+            router: router,
         };
 
         // Initialize the connection -- send own settings and process the peer's
@@ -127,27 +157,34 @@ impl<TS: TransportStream + Sized> GrpcServerConnection<TS> {
         Ok(server)
     }
 
-    fn handle_requests(&mut self) -> HttpResult<Vec<(StreamId, Vec<u8>)>> {
-        Ok(self.conn
-               .state
-               .iter()
-               .filter(|&(_, ref s)| s.is_closed_remote())
-               .flat_map(|(&id, stream)| stream.handle_request(id))
-               .collect())
+    fn handle_requests(&mut self) -> HttpResult<Vec<GrpcResponse>> {
+        let router = self.router.clone();
+        let closed = self.conn
+                         .state
+                         .iter()
+                         .filter(|&(_, ref s)| s.is_closed_remote());
+
+        let responses = closed.map(|(&stream_id, stream)| {
+            let req = GrpcRequest {
+                stream_id: stream_id,
+                headers: stream.headers.as_ref().unwrap(),
+                body: &stream.body,
+            };
+
+            router.handle_request(req)
+        });
+
+        Ok(responses.collect())
     }
 
-    fn prepare_responses(&mut self, responses: Vec<(StreamId, Vec<u8>)>) -> HttpResult<()> {
-        for (stream_id, body) in responses {
-            let headers = vec![
-                Header::new(b":status", b"200"),
-                Header::new(&b"content-type"[..], &b"application/grpc"[..]),
-            ];
-
-            try!(self.conn.start_response(headers, stream_id, EndStream::No, &mut self.sender));
-
-            let mut stream = self.conn.state.get_stream_mut(stream_id).unwrap();
-
-            stream.set_full_data(body);
+    fn prepare_responses(&mut self, responses: Vec<GrpcResponse>) -> HttpResult<()> {
+        for response in responses {
+            try!(self.conn.start_response(response.headers,
+                                          response.stream_id,
+                                          EndStream::No,
+                                          &mut self.sender));
+            let mut stream = self.conn.state.get_stream_mut(response.stream_id).unwrap();
+            stream.set_full_data(response.body);
         }
 
         Ok(())
@@ -191,20 +228,18 @@ impl<TS: TransportStream + Sized> GrpcServerConnection<TS> {
     }
 }
 
-pub trait GrpcServer<TS>: Sized
-    where TS: TransportStream
-{
-    fn new<A: ToSocketAddrs>(addr: A) -> GrpcResult<Self>;
+pub trait GrpcServer<TS: TransportStream>: Sized {
+    fn new<A: ToSocketAddrs>(router: Arc<GrpcRouter>, addr: A) -> GrpcResult<Self>;
 
     fn accept(&self) -> GrpcResult<TS>;
 
-    fn run<F>(&mut self, mut handler: F)
-        where F: FnMut(GrpcServerConnection<TS>)
-    {
+    fn router(&self) -> Arc<GrpcRouter>;
+
+    fn run<F: FnMut(GrpcServerConnection<TS>)>(&mut self, mut handler: F) {
         loop {
             match self.accept() {
                 Ok(stream) => {
-                    match GrpcServerConnection::<TS>::new(stream) {
+                    match GrpcServerConnection::<TS>::new(self.router(), stream) {
                         Ok(conn) => handler(conn),
                         Err(ref err) => warn!("create connection error, {}", err),
                     }
@@ -216,16 +251,24 @@ pub trait GrpcServer<TS>: Sized
 }
 
 pub struct TcpServer {
+    router: Arc<GrpcRouter>,
     listener: TcpListener,
 }
 
 impl GrpcServer<TcpStream> for TcpServer {
-    fn new<A: ToSocketAddrs>(addr: A) -> GrpcResult<TcpServer> {
+    fn new<A: ToSocketAddrs>(router: Arc<GrpcRouter>, addr: A) -> GrpcResult<TcpServer> {
         let listener = try!(TcpListener::bind(addr));
 
         info!("TCP server is listening on {}", try!(listener.local_addr()));
 
-        Ok(TcpServer { listener: listener })
+        Ok(TcpServer {
+            router: router,
+            listener: listener,
+        })
+    }
+
+    fn router(&self) -> Arc<GrpcRouter> {
+        self.router.clone()
     }
 
     fn accept(&self) -> GrpcResult<TcpStream> {
@@ -238,17 +281,19 @@ impl GrpcServer<TcpStream> for TcpServer {
 }
 
 pub struct SslServer {
+    router: Arc<GrpcRouter>,
     listener: TcpListener,
     context: Arc<SslContext>,
 }
 
 impl GrpcServer<SslStream<TcpStream>> for SslServer {
-    fn new<A: ToSocketAddrs>(addr: A) -> GrpcResult<SslServer> {
+    fn new<A: ToSocketAddrs>(router: Arc<GrpcRouter>, addr: A) -> GrpcResult<SslServer> {
         let listener = try!(TcpListener::bind(addr));
 
         info!("SSL server is listening on {}", try!(listener.local_addr()));
 
         Ok(SslServer {
+            router: router,
             listener: listener,
             context: Arc::new({
                 let mut ctxt = try!(SslContext::new(SslMethod::Tlsv1_1));
@@ -261,6 +306,10 @@ impl GrpcServer<SslStream<TcpStream>> for SslServer {
                 ctxt
             }),
         })
+    }
+
+    fn router(&self) -> Arc<GrpcRouter> {
+        self.router.clone()
     }
 
     fn accept(&self) -> GrpcResult<SslStream<TcpStream>> {
