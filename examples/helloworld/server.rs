@@ -27,7 +27,7 @@ impl Greeter for TcpServer {
 fn main() {
     env_logger::init().unwrap();
 
-    let router = GrpcRouter::new();
+    let router = GrpcRouter::default();
 
     TcpServer::new(Arc::new(router), "127.0.0.1:50051").unwrap().run(|mut conn| {
         thread::spawn(move || conn.run());
