@@ -4,6 +4,11 @@ extern crate protobuf;
 extern crate solicit;
 extern crate openssl;
 
+#[cfg(test)]
+extern crate env_logger;
+#[cfg(test)]
+extern crate hpack;
+
 pub mod errors;
 pub mod codegen;
 pub mod server;

@@ -20,6 +20,7 @@ path = "../rust-protobuf"
 
 [dev-dependencies]
 env_logger = "0.3"
+hpack = "0.3"
 
 [[bin]]
 

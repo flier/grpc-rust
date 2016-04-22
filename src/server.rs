@@ -6,7 +6,6 @@ use std::str;
 use std::convert::From;
 use std::sync::Arc;
 use std::time::Duration;
-use std::error::Error;
 
 use solicit::http::server::StreamFactory;
 use solicit::http::server::ServerConnection;
@@ -50,17 +49,6 @@ impl<'a> fmt::Debug for BsDebug<'a> {
     }
 }
 
-struct HeaderDebug<'a>(&'a Header<'a, 'a>);
-
-impl<'a> fmt::Debug for HeaderDebug<'a> {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(fmt,
-               "Header {{ name: {:?}, value: {:?} }}",
-               BsDebug(self.0.name()),
-               BsDebug(self.0.value()))
-    }
-}
-
 /// The struct represents a fully received request.
 pub struct GrpcRequest<'a, 'n, 'v>
     where 'n: 'a,
@@ -83,14 +71,9 @@ pub struct GrpcRequest<'a, 'n, 'v>
 }
 
 impl<'a, 'n, 'v> GrpcRequest<'a, 'n, 'v> {
-    fn new(stream: &'a GrpcStream) -> GrpcResult<GrpcRequest<'a, 'n, 'v>> {
-        if stream.stream_id.is_none() || stream.headers.is_none() ||
-           stream.headers.as_ref().unwrap().len() == 0 {
-            return Err(GrpcError::BadRequest("malformed stream"));
-        }
-
+    fn new(stream: &'a GrpcStream) -> GrpcRequest<'a, 'n, 'v> {
         let mut req = GrpcRequest {
-            stream_id: stream.stream_id.unwrap(),
+            stream_id: stream.stream_id.unwrap_or(0),
             headers: stream.headers.as_ref().unwrap(),
             body: &stream.body,
             scheme: None,
@@ -105,12 +88,12 @@ impl<'a, 'n, 'v> GrpcRequest<'a, 'n, 'v> {
             message_type: None,
         };
 
-        try!(req.parse_headers());
+        req.parse_headers();
 
-        Ok(req)
+        req
     }
 
-    fn parse_headers(&mut self) -> GrpcResult<()> {
+    fn parse_headers(&mut self) {
         unsafe {
             for header in self.headers {
                 match header.name() {
@@ -156,8 +139,6 @@ impl<'a, 'n, 'v> GrpcRequest<'a, 'n, 'v> {
                 }
             }
         }
-
-        Ok(())
     }
 
     fn parse_timeout(s: &[u8]) -> GrpcResult<Duration> {
@@ -361,7 +342,7 @@ impl GrpcResponses {
 }
 
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct GrpcRouter {
 
 }
@@ -377,11 +358,24 @@ impl GrpcRouter {
                                               "only support POST method");
         }
 
+        if req.content_type != Some("application/grpc+proto") {
+            return GrpcResponses::bad_request(req.stream_id,
+                                              GrpcStatus::Unimplemented,
+                                              "only support `application/grpc+proto` type");
+        }
+
+        if let Some(encoding) = req.encoding {
+            return GrpcResponses::bad_request(req.stream_id,
+                                              GrpcStatus::Unimplemented,
+                                              format!("not support `{}` encoding", encoding)
+                                                  .as_str());
+        }
+
         Response {
             stream_id: req.stream_id,
             headers: vec![
                 Header::new(b":status", b"200"),
-                Header::new(&b"content-type"[..], &b"application/grpc"[..]),
+                Header::new(&b"content-type"[..], &b"application/grpc+proto"[..]),
                 Header::new(&b"grpc-status"[..], GrpcStatus::Ok.as_str()),
             ],
             body: req.body.to_vec(),
@@ -389,9 +383,10 @@ impl GrpcRouter {
     }
 }
 
-type GrpcStream = DefaultStream;
+pub type GrpcStream = DefaultStream;
 
-struct GrpcStreamFactory;
+#[derive(Clone, Default, Debug)]
+pub struct GrpcStreamFactory;
 
 impl StreamFactory for GrpcStreamFactory {
     type Stream = GrpcStream;
@@ -402,10 +397,10 @@ impl StreamFactory for GrpcStreamFactory {
 }
 
 pub struct GrpcServerConnection<TS: TransportStream> {
-    conn: ServerConnection<GrpcStreamFactory, DefaultSessionState<ServerMarker, GrpcStream>>,
-    receiver: TS,
-    sender: TS,
-    router: Arc<GrpcRouter>,
+    pub conn: ServerConnection<GrpcStreamFactory, DefaultSessionState<ServerMarker, GrpcStream>>,
+    pub receiver: TS,
+    pub sender: TS,
+    pub router: Arc<GrpcRouter>,
 }
 
 impl<TS: TransportStream + Sized> GrpcServerConnection<TS> {
@@ -415,7 +410,7 @@ impl<TS: TransportStream + Sized> GrpcServerConnection<TS> {
         try!(TransportStream::read_exact(&mut stream, &mut preface));
 
         if &preface != b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
-            panic!();
+            return Err(GrpcError::BadRequest("only support HTTP 2.0"));
         }
 
         let conn = HttpConnection::new(HttpScheme::Http);
@@ -437,21 +432,18 @@ impl<TS: TransportStream + Sized> GrpcServerConnection<TS> {
     }
 
     fn handle_requests(&mut self) -> HttpResult<Vec<GrpcResponse>> {
-        let router = self.router.clone();
+        try!(self.conn.handle_next_frame(&mut TransportReceiveFrame::new(&mut self.receiver),
+                                         &mut self.sender));
         let closed = self.conn
                          .state
                          .iter()
-                         .filter(|&(_, ref s)| s.is_closed_remote());
+                         .filter(|&(_, ref stream)| stream.is_closed_remote());
 
-        let responses = closed.map(|(&stream_id, stream)| {
-            GrpcRequest::new(stream)
-                .map(|request| router.handle_request(request))
-                .unwrap_or_else(|err| {
-                    GrpcResponses::bad_request(stream_id, GrpcStatus::Unknown, err.description())
-                })
-        });
+        let router = self.router.clone();
 
-        Ok(responses.collect())
+        Ok(closed.map(|(_, stream)| GrpcRequest::new(stream))
+                 .map(|request| router.handle_request(request))
+                 .collect())
     }
 
     fn prepare_responses(&mut self, responses: Vec<GrpcResponse>) -> HttpResult<()> {
@@ -484,9 +476,6 @@ impl<TS: TransportStream + Sized> GrpcServerConnection<TS> {
     }
 
     fn handle_next(&mut self) -> HttpResult<()> {
-        try!(self.conn.handle_next_frame(&mut TransportReceiveFrame::new(&mut self.receiver),
-                                         &mut self.sender));
-
         let responses = try!(self.handle_requests());
 
         try!(self.prepare_responses(responses));
@@ -604,42 +593,38 @@ impl GrpcServer<SslStream<TcpStream>> for SslServer {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
-    use std::io::{Read, Write, Cursor};
-    use std::sync::Arc;
-    use std::time::Duration;
+    #[cfg(test)]
+    mod request {
+        use std::time::Duration;
 
-    use solicit::http::Header;
-    use solicit::http::session::{Stream, DefaultStream};
-    use solicit::http::transport::TransportStream;
+        use solicit::http::Header;
+        use solicit::http::session::{Stream, DefaultStream};
 
-    use super::*;
-    use super::super::errors::GrpcError;
+        use super::super::GrpcRequest;
+        use super::super::super::errors::GrpcError;
 
-    #[test]
-    fn test_parse_timeout() {
-        assert_eq!(GrpcRequest::parse_timeout(&b"1H"[..]).unwrap().as_secs(),
-                   60 * 60);
-        assert_eq!(GrpcRequest::parse_timeout(&b"2M"[..]).unwrap().as_secs(),
-                   2 * 60);
-        assert_eq!(GrpcRequest::parse_timeout(&b"3S"[..]).unwrap().as_secs(), 3);
-        assert_eq!(GrpcRequest::parse_timeout(&b"4m"[..]).unwrap().subsec_nanos(),
-                   4_000_000);
-        assert_eq!(GrpcRequest::parse_timeout(&b"5u"[..]).unwrap().subsec_nanos(),
-                   5_000);
-        assert_eq!(GrpcRequest::parse_timeout(&b"6n"[..]).unwrap().subsec_nanos(),
-                   6);
+        #[test]
+        fn test_parse_timeout() {
+            assert_eq!(GrpcRequest::parse_timeout(&b"1H"[..]).unwrap().as_secs(),
+                       60 * 60);
+            assert_eq!(GrpcRequest::parse_timeout(&b"2M"[..]).unwrap().as_secs(),
+                       2 * 60);
+            assert_eq!(GrpcRequest::parse_timeout(&b"3S"[..]).unwrap().as_secs(), 3);
+            assert_eq!(GrpcRequest::parse_timeout(&b"4m"[..]).unwrap().subsec_nanos(),
+                       4_000_000);
+            assert_eq!(GrpcRequest::parse_timeout(&b"5u"[..]).unwrap().subsec_nanos(),
+                       5_000);
+            assert_eq!(GrpcRequest::parse_timeout(&b"6n"[..]).unwrap().subsec_nanos(),
+                       6);
 
-        assert!(GrpcRequest::parse_timeout(&b"test"[..]).is_err());
-    }
+            assert!(GrpcRequest::parse_timeout(&b"test"[..]).is_err());
+        }
 
-    #[test]
-    fn test_request() {
-        let mut stream = DefaultStream::with_id(123);
+        #[test]
+        fn test_request() {
+            let mut stream = DefaultStream::with_id(123);
 
-        assert!(GrpcRequest::new(&stream).is_err());
-
-        stream.set_headers(vec![
+            stream.set_headers(vec![
             Header::new(&b":scheme"[..], &b"https"[..]),
             Header::new(&b":method"[..], &b"POST"[..]),
             Header::new(&b":path"[..], &b"/helloworld"[..]),
@@ -653,58 +638,165 @@ mod tests {
             Header::new(&b"grpc-message-type"[..], &b"HelloWorld"[..]),
         ]);
 
-        let req = GrpcRequest::new(&stream).unwrap();
+            let req = GrpcRequest::new(&stream);
 
-        assert_eq!(req.stream_id, 123);
-        assert_eq!(req.scheme, Some("https"));
-        assert_eq!(req.method, Some("POST"));
-        assert_eq!(req.path, Some("/helloworld"));
-        assert_eq!(req.authority, Some("test.com"));
-        assert_eq!(req.timeout, Some(Duration::new(30, 0)));
-        assert_eq!(req.content_type, Some("application/grpc"));
-        assert_eq!(req.encoding, Some("gzip"));
-        assert_eq!(req.accept_encoding, Some("deflate"));
-        assert_eq!(req.user_agent, Some("test"));
-        assert_eq!(req.message_type, Some("HelloWorld"));
-    }
-
-    #[derive(Clone)]
-    struct TestStream<T: Read + Write + Sized + Clone>(T);
-
-    impl<T: Read + Write + Sized + Clone> Read for TestStream<T> {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.0.read(buf)
+            assert_eq!(req.stream_id, 123);
+            assert_eq!(req.scheme, Some("https"));
+            assert_eq!(req.method, Some("POST"));
+            assert_eq!(req.path, Some("/helloworld"));
+            assert_eq!(req.authority, Some("test.com"));
+            assert_eq!(req.timeout, Some(Duration::new(30, 0)));
+            assert_eq!(req.content_type, Some("application/grpc"));
+            assert_eq!(req.encoding, Some("gzip"));
+            assert_eq!(req.accept_encoding, Some("deflate"));
+            assert_eq!(req.user_agent, Some("test"));
+            assert_eq!(req.message_type, Some("HelloWorld"));
         }
     }
 
-    impl<T: Read + Write + Sized + Clone> Write for TestStream<T> {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.write(buf)
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            self.0.flush()
-        }
-    }
+    #[cfg(test)]
+    mod connection {
+        use std::fmt;
+        use std::io;
+        use std::io::{Read, Write, Seek, SeekFrom, Cursor};
+        use std::sync::Arc;
+        use std::error::Error;
 
-    impl<T: Read + Write + Sized + Clone> TransportStream for TestStream<T> {
-        fn try_split(&self) -> io::Result<Self> {
-            Ok(TestStream(self.0.clone()))
+        use env_logger;
+        use hpack::Encoder;
+
+        use solicit::http::frame::{FrameIR, HeadersFrame, HeadersFlag};
+        use solicit::http::Header;
+        use solicit::http::transport::TransportStream;
+        use solicit::http::client;
+
+        use super::super::{GrpcRouter, GrpcServerConnection};
+        use super::super::super::errors::GrpcError;
+
+        #[derive(Clone, Debug)]
+        struct TestStream {
+            input: Cursor<Vec<u8>>,
+            output: Cursor<Vec<u8>>,
         }
 
-        fn close(&mut self) -> io::Result<()> {
-            Ok(())
+        impl TestStream {
+            fn new() -> TestStream {
+                TestStream {
+                    input: Cursor::new(Vec::new()),
+                    output: Cursor::new(Vec::new()),
+                }
+            }
+
+            fn insert_frame<F: FrameIR + fmt::Debug>(&mut self, frame: F) {
+                debug!("insert frame to input: {:?}", &frame);
+
+                let mut buf = Cursor::new(Vec::new());
+                frame.serialize_into(&mut buf).unwrap();
+                self.input.write(buf.into_inner().as_slice()).unwrap();
+            }
         }
-    }
 
-    #[test]
-    fn test_server_connection() {
-        let mut router = Arc::new(GrpcRouter::default());
-        let mut stream = TestStream(Cursor::new(Vec::new()));
+        impl Read for TestStream {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                debug!("read {} bytes from input: {:?}", buf.len(), self.input);
 
-        if let GrpcError::IoError(err) = GrpcServerConnection::new(router, stream).err().unwrap() {
-            assert_eq!(err.kind(), io::ErrorKind::Other);
-        } else {
-            panic!()
+                self.input.read(buf)
+            }
+        }
+
+        impl Write for TestStream {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                debug!("write {} bytes to output: {:?}", buf.len(), self.output);
+
+                self.output.write(buf)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                debug!("flush output: {:?}", self.output);
+
+                self.output.flush()
+            }
+        }
+
+        impl TransportStream for TestStream {
+            fn try_split(&self) -> io::Result<Self> {
+                debug!("try to split stream: {:?}", self);
+
+                Ok(self.clone())
+            }
+
+            fn close(&mut self) -> io::Result<()> {
+                debug!("try to close stream: {:?}", self);
+
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn test_empty_stream() {
+            let _ = env_logger::init();
+
+            let router = Arc::new(GrpcRouter::default());
+            let stream = TestStream::new();
+
+            let res = GrpcServerConnection::new(router, stream);
+
+            assert!(res.is_err());
+            assert_eq!(res.err().unwrap().description(), "Not enough bytes");
+        }
+
+        #[test]
+        fn test_stream_with_settings() {
+            let _ = env_logger::init();
+
+            let router = Arc::new(GrpcRouter::default());
+            let mut stream = TestStream::new();
+
+            client::write_preface(&mut stream.input).unwrap();
+
+            stream.input.seek(SeekFrom::Start(0)).unwrap();
+
+            assert!(GrpcServerConnection::new(router, stream).is_ok());
+        }
+
+        #[test]
+        fn test_stream_with_request() {
+            let _ = env_logger::init();
+
+            let router = Arc::new(GrpcRouter::default());
+            let mut stream = TestStream::new();
+
+            client::write_preface(&mut stream.input).unwrap();
+
+            let headers = vec![
+                Header::new(&b":scheme"[..], &b"https"[..]),
+                Header::new(&b":method"[..], &b"POST"[..]),
+                Header::new(&b":path"[..], &b"/helloworld"[..]),
+                Header::new(&b":authority"[..], &b"test.com"[..]),
+                Header::new(&b"grpc-timeout"[..], &b"30S"[..]),
+                Header::new(&b"content-type"[..], &b"application/grpc"[..]),
+                Header::new(&b"grpc-encoding"[..], &b"gzip"[..]),
+                Header::new(&b"grpc-accept-encoding"[..], &b"deflate"[..]),
+                Header::new(&b"grpc-timeout"[..], &b"30S"[..]),
+                Header::new(&b"user-agent"[..], &b"test"[..]),
+                Header::new(&b"grpc-message-type"[..], &b"HelloWorld"[..]),
+            ];
+
+            let mut encoder = Encoder::new();
+            let frag = encoder.encode(headers.iter().map(|h| (h.name(), h.value())));
+
+            let mut frame = HeadersFrame::new(frag, 123);
+
+            frame.set_flag(HeadersFlag::EndStream);
+
+            stream.insert_frame(frame);
+
+            stream.input.seek(SeekFrom::Start(0)).unwrap();
+
+            let mut conn = GrpcServerConnection::new(router, stream).unwrap();
+
+            let responses = conn.handle_requests().unwrap();
+
+            assert_eq!(responses.len(), 1);
         }
     }
 }
