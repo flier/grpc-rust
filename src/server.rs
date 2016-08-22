@@ -4,6 +4,8 @@ use std::fmt;
 use std::io::Cursor;
 use std::io::Read;
 use std::convert::From;
+use std::sync::Arc;
+use std::thread;
 
 use solicit::server::SimpleServer;
 use solicit::http::server::StreamFactory;
@@ -70,14 +72,14 @@ struct GrpcStream {
     state: StreamState,
     data: Option<Cursor<Vec<u8>>>,
 
-    buf: Vec<u8>,
-    resp: Vec<u8>,
-    service_definition: ServerServiceDefinition,
+    req_buf: Vec<u8>,
+    resp_buf: Vec<u8>,
+    service_definition: Arc<ServerServiceDefinition>,
     path: String,
 }
 
 impl GrpcStream {
-    fn with_id(stream_id: StreamId) -> Self {
+    fn with_id(stream_id: StreamId, service_definition: Arc<ServerServiceDefinition>) -> Self {
         println!("new stream {}", stream_id);
         GrpcStream {
             stream_id: Some(stream_id),
@@ -85,16 +87,16 @@ impl GrpcStream {
             body: Vec::new(),
             state: StreamState::Open,
             data: None,
-            buf: Vec::new(),
-            resp: Vec::new(),
-            service_definition: ServerServiceDefinition::new(Vec::new()),
+            req_buf: Vec::new(),
+            resp_buf: Vec::new(),
+            service_definition: service_definition,
             path: String::new(),
         }
     }
 
     fn process_buf(&mut self) {
         loop {
-            let (r, pos) = match grpc::parse_frame(&self.buf) {
+            let (r, pos) = match grpc::parse_frame(&self.req_buf) {
                 Some((frame, pos)) => {
                     let r = self.service_definition.handle_method(&self.path, frame);
                     (r, pos)
@@ -102,8 +104,8 @@ impl GrpcStream {
                 None => return,
             };
 
-            self.buf.drain(..pos);
-            self.resp.extend(r);
+            self.req_buf.drain(..pos);
+            grpc::write_frame(&mut self.resp_buf, &r);
         }
     }
 }
@@ -123,11 +125,9 @@ impl Stream for GrpcStream {
     }
 
     fn new_data_chunk(&mut self, data: &[u8]) {
-        println!("hooray! data: {:?}", data);
-        self.buf.extend(data);
+        println!("hooray! data chunk: {:?} in stream {:?}", data, self.stream_id);
+        self.req_buf.extend(data);
         self.process_buf();
-        println!("{:?}", grpc::parse_frame(data));
-        self.body.extend(data.to_vec().into_iter());
     }
 
     fn set_state(&mut self, state: StreamState) {
@@ -183,13 +183,15 @@ impl GrpcSessionState {
 }
 */
 
-struct GrpcStreamFactory;
+struct GrpcStreamFactory {
+    service_definition: Arc<ServerServiceDefinition>,
+}
 
 impl StreamFactory for GrpcStreamFactory {
 	type Stream = GrpcStream;
 
 	fn create(&mut self, id: StreamId) -> GrpcStream {
-		GrpcStream::with_id(id)
+		GrpcStream::with_id(id, self.service_definition.clone())
 	}
 }
 
@@ -202,7 +204,7 @@ struct GrpcServerConnection {
 }
 
 impl GrpcServerConnection {
-    fn new(mut stream: TcpStream) -> GrpcServerConnection {
+    fn new(mut stream: TcpStream, service_definition: Arc<ServerServiceDefinition>) -> GrpcServerConnection {
         let mut preface = [0; 24];
 
         (&mut stream as &mut Read).read_exact(&mut preface).unwrap();
@@ -218,7 +220,9 @@ impl GrpcServerConnection {
             state: DefaultSessionState::<Server, _>::new(),
             receiver: xx,
             sender: stream,
-            factory: GrpcStreamFactory,
+            factory: GrpcStreamFactory {
+                service_definition: service_definition,
+            },
         };
 
         //r.server_conn.init().unwrap();
@@ -227,10 +231,10 @@ impl GrpcServerConnection {
     
     fn handle_requests(&mut self) -> HttpResult<Vec<(StreamId, Vec<u8>)>> {
         Ok(self.state.iter().flat_map(|(&id, s)| {
-            if s.resp.is_empty() {
+            if s.resp_buf.is_empty() {
                 None
             } else {
-                Some((id, s.resp.clone()))
+                Some((id, s.resp_buf.clone()))
             }        
         }).collect())
     }
@@ -314,19 +318,24 @@ impl GrpcServerConnection {
 
 pub struct GrpcServer {
     listener: TcpListener,
+    service_definition: Arc<ServerServiceDefinition>,
 }
 
 impl GrpcServer {
-    pub fn new() -> GrpcServer {
+    pub fn new(service_definition: Arc<ServerServiceDefinition>) -> GrpcServer {
         GrpcServer {
             listener: TcpListener::bind("127.0.0.1:50051").unwrap(),
+            service_definition: service_definition,
         }
     }
 
     pub fn run(&mut self) {
         for mut stream in self.listener.incoming().map(|s| s.unwrap()) {
             println!("client connected!");
-            GrpcServerConnection::new(stream).run();
+            let service_definition = self.service_definition.clone();
+            thread::spawn(|| {
+                GrpcServerConnection::new(stream, service_definition).run();
+            });
         }
     }
 }
